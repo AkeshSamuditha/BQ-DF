@@ -7,7 +7,7 @@ import threading
 from google.cloud import bigquery
 from google.api_core.exceptions import NotFound
 from datetime import datetime, timezone
-from config import PROJECT_ID, DATASET
+from config import PROJECT_ID, DATASET, PRECISION
 import os
 # Configuration
 NUM_TABLES = 100
@@ -97,11 +97,10 @@ def generate_row(counter_id: int) -> typing.Tuple[typing.Dict[str, typing.Any], 
 def worker_task(table_index: int, sleep_interval: float):
     table_name = f"{TABLE_PREFIX}_{table_index}"
     table_id = f"{PROJECT_ID}.{DATASET}.{table_name}"
-    log_folder = "/add_data"
+    log_folder = "add_data"
     os.makedirs(log_folder, exist_ok=True)
-    log_filename = f"{log_folder}/{table_name}.log"
+    log_filename = os.path.join(log_folder, f"{table_name}.log")
 
-    
     current_counter = 1
     # Randomize start to avoid thundering herd on logs
     time.sleep(random.random() * 2)
@@ -135,10 +134,15 @@ def worker_task(table_index: int, sleep_interval: float):
             break
 
 if __name__ == "__main__":
+    from argparse import ArgumentParser
+    parser = ArgumentParser(description='Run multi-table data generator')
+    parser.add_argument('--tables', type=int, default=1, required=True, help='Number of Tables')
+    args = parser.parse_args()
+    NUM_TABLES = args.tables
     create_tables_if_not_exists()
     print(f"Starting multi-threaded generator for {NUM_TABLES} tables...")
     
-    TABLE_SLEEP_TIMES = {i: 0.01 for i in range(1, NUM_TABLES + 1)}
+    TABLE_SLEEP_TIMES = {i: 10 for i in range(1, NUM_TABLES + 1)}
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=NUM_TABLES) as executor:
         futures = []

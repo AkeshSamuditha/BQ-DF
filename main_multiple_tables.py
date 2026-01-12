@@ -9,6 +9,7 @@ import logging
 import typing
 import json
 import argparse
+from config import PRECISION
 
 # Import shared classes to ensure pickle compatibility on workers
 from bq_common import (
@@ -17,9 +18,13 @@ from bq_common import (
     BQCDCRestrictionProvider, 
     BQCDCWatermarkEstimatorProvider, 
     BQCDCWatermarkEstimator,
-    PRECISION
 )
-
+from utils import (
+    convert_macros_to_seconds, 
+    convert_macros_to_ts,
+    convert_seconds_to_macros, 
+    simulate_cpu_work
+)
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -48,7 +53,7 @@ DATASET = "poc_cdc"
 # DoFn definition
 class BQCDCDoFn(DoFn):
     """Splittable DoFn for streaming CDC from BigQuery"""
-
+    
     def __init__(self, project: str, dataset: str):
         self.project: str = project
         self.dataset: str = dataset
@@ -56,14 +61,8 @@ class BQCDCDoFn(DoFn):
 
     def _build_query(self, table_name, start_micros, end_micros):
         """Construct the SQL query based on mode"""
-        start_ts_sec = start_micros / PRECISION
-        end_ts_sec = end_micros / PRECISION
-        
-        start_dt = datetime.fromtimestamp(start_ts_sec, tz=timezone.utc)
-        end_dt = datetime.fromtimestamp(end_ts_sec, tz=timezone.utc)
-        
-        start_str = start_dt.strftime('%Y-%m-%d %H:%M:%S.%f')
-        end_str = end_dt.strftime('%Y-%m-%d %H:%M:%S.%f')
+        start_str = convert_macros_to_ts(start_micros)
+        end_str = convert_macros_to_ts(end_micros)
 
         if self.mode == 'polling':
             return f"""
@@ -86,6 +85,9 @@ class BQCDCDoFn(DoFn):
                 )
                 ORDER BY _CHANGE_TIMESTAMP
             """
+    def setup(self):
+        self.client = bigquery.Client(project=self.project)
+        return super().setup
 
     @DoFn.unbounded_per_element()
     def process(
@@ -97,37 +99,43 @@ class BQCDCDoFn(DoFn):
         
         current_pos = tracker.current_restriction().start
         now = datetime.now(timezone.utc)
-        target_pos = int(now.timestamp() * PRECISION)
+        target_pos = int(convert_seconds_to_macros(now.timestamp()))
 
-        # 
+        # move to next poll if caught up. In practical this should never happen 
         if current_pos >= target_pos:
-            tracker.defer_remainder(Duration.of(seconds=element.poll_interval))
+            logger.info("Caught up to current time, deferring...")
+            tracker.defer_remainder(Duration.of(seconds=element.poll_interval)) # cause checkpointing and call split to update restriction state for next process
             return
-
-        if not tracker.try_claim(target_pos - 1):
-             logger.info("Claim failed. Stopping.")
-             return
-
+       
         try:
             query = self._build_query(element.table_name, current_pos, target_pos)
             
             # Simulate REAL work (CPU intensive) to trigger autoscaling
-            self._simulate_cpu_work()
+            simulate_cpu_work()
             
-            client = bigquery.Client(project=self.project)
-            query_job = client.query(query)
+            query_job = self.client.query(query)
             rows = list(query_job.result())
             
             if len(rows) == 0:
-                # if no rows found advance watermark to target
-                watermark_estimator.observe_timestamp(Timestamp.of(target_pos / PRECISION))
+                logger.info(f"No new records found at {now.isoformat()} between {convert_macros_to_ts(current_pos)} and {convert_macros_to_ts(target_pos)}")
+                # if no rows found do nothing
+                # If no rows found for a certain time, eg: 1 hour. We can advance the watermark and restriction
+                tracker.defer_remainder(Duration.of(seconds=element.poll_interval))
+                return
+            
+            # Track the max timestamp across all processed records
+            max_claimed_pos = current_pos # Initialize to current position
+            
             for row in rows:
                 payload = dict(row)
                 
                 # ASSUMPTION - change_ts is always present and is a datetime
                 ts_dt = payload.get('change_timestamp')
-
-                ts_seconds = int(ts_dt.timestamp())
+                ts_seconds = ts_dt.timestamp()
+                record_pos = int(convert_seconds_to_macros(ts_seconds))
+                
+                # Track max position seen
+                max_claimed_pos = max(max_claimed_pos, record_pos)
                 
                 record = BQRecord(
                     table_name=element.table_name,
@@ -140,30 +148,23 @@ class BQCDCDoFn(DoFn):
                 watermark_estimator.observe_timestamp(Timestamp.of(ts_seconds))
                 yield beam.window.TimestampedValue(record, ts_seconds)
 
+            # Claim ONCE at the end using the max timestamp seen
+            if not tracker.try_claim(max_claimed_pos):
+                logger.warning(f"[{element.table_name}] Final claim failed at {max_claimed_pos} with current position {convert_macros_to_ts(current_pos)}.")
+                tracker.defer_remainder(Duration.of(seconds=element.poll_interval))
+                return
+                
         except Exception as e:
             logger.error(f"Error querying BQ: {e}")
             raise e
 
         tracker.defer_remainder(Duration.of(seconds=element.poll_interval))
 
-    def _simulate_cpu_work(self):
-        """Burn CPU to simulate heavy processing logic (e.g. parsing, enrichment)."""
-        # Calculate primes to burn CPU cycles
-        count = 0
-        num = 2
-        while count < 3000: 
-            is_prime = True
-            for i in range(2, int(num ** 0.5) + 1):
-                if num % i == 0:
-                    is_prime = False
-                    break
-            if is_prime:
-                count += 1
-            num += 1
 
-def run(args) -> None:
-    NUM_TABLES = 100  # Adjust as needed
+def run(args, beam_args) -> None:
+    NUM_TABLES = args.tables
     options = beam.options.pipeline_options.PipelineOptions(
+        flags=beam_args,
         runner="DataflowRunner",
         project=PROJECT_ID,
         region=REGION,
@@ -173,9 +174,9 @@ def run(args) -> None:
         save_main_session=True,
         num_workers=1,
         max_num_workers=NUM_TABLES,
-        setup_file='./setup.py', # Add setup.py to package common module
-        job_name=f'bq-cdc-{args.run_id}'
-        # worker_machine_type="n1-standard-1"
+        setup_file='./setup.py',
+        job_name=f'bq-cdc-{args.run_id}',
+        # worker_machine_type="n1-standard-1",
     )
 
     logger.info("Building pipeline...")
@@ -204,10 +205,9 @@ def run(args) -> None:
 
 
 if __name__ == '__main__':
-    
     parser = argparse.ArgumentParser(description='Run BQ CDC pipeline')
     parser.add_argument('--run_id', type=str, required=True, help='Name of the Job')
-    parser.add_argument('--tables', type=int, default=1, required=True, help='Number of Tables')
-    args = parser.parse_args()
+    parser.add_argument('--tables', type=int, default=2, required=True, help='Number of Tables')
+    known_args, beam_args = parser.parse_known_args()
     
-    run(args)
+    run(known_args, beam_args)

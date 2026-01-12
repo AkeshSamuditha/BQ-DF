@@ -7,10 +7,9 @@ from apache_beam.transforms.core import RestrictionProvider, WatermarkEstimatorP
 from apache_beam.io.watermark_estimators import WatermarkEstimator
 from apache_beam.io.restriction_trackers import OffsetRange, OffsetRestrictionTracker
 from apache_beam.utils.timestamp import Timestamp
+from config import PRECISION
 
 logger = logging.getLogger(__name__)
-
-PRECISION = 1_000_000 
 
 # Class to hold configuration for each table
 class BQTableConfig(typing.NamedTuple):
