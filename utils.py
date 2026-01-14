@@ -23,7 +23,7 @@ def convert_macros_to_ts(microseconds: int) -> int:
     return ts
     
 
-def simulate_cpu_work(self):
+def simulate_cpu_work():
     """Burn CPU to simulate heavy processing logic (e.g. parsing, enrichment)."""
     # Calculate primes to burn CPU cycles
     count = 0

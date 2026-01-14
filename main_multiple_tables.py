@@ -13,11 +13,18 @@ from config import PRECISION
 
 # Import shared classes to ensure pickle compatibility on workers
 from bq_common import (
-    BQTableConfig, 
-    BQRecord, 
-    BQCDCRestrictionProvider, 
+    # BQTableConfig, 
+    # BQRecord, 
+    # BQCDCRestrictionProvider, 
     BQCDCWatermarkEstimatorProvider, 
     BQCDCWatermarkEstimator,
+)
+
+from restriction import (
+    BQCDCRestrictionProvider,
+    BQRecord,
+    BQTableConfig,
+    # BQCDCRestrictionTracker
 )
 from utils import (
     convert_macros_to_seconds, 
@@ -63,7 +70,7 @@ class BQCDCDoFn(DoFn):
         """Construct the SQL query based on mode"""
         start_str = convert_macros_to_ts(start_micros)
         end_str = convert_macros_to_ts(end_micros)
-
+        logger.info(f"Building query for {table_name} from {start_str} to {end_str}")
         if self.mode == 'polling':
             return f"""
             SELECT event_id, change_type, payload, change_timestamp
@@ -108,7 +115,9 @@ class BQCDCDoFn(DoFn):
             return
        
         try:
-            query = self._build_query(element.table_name, current_pos, target_pos)
+            previous_succesfull_claim = tracker.current_restriction().prev_succefull_claim
+            query_start_pos = (current_pos + previous_succesfull_claim) // 2 
+            query = self._build_query(element.table_name, query_start_pos, target_pos)
             
             # Simulate REAL work (CPU intensive) to trigger autoscaling
             simulate_cpu_work()
