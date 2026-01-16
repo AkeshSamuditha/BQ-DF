@@ -13,19 +13,19 @@ from config import PRECISION
 
 # Import shared classes to ensure pickle compatibility on workers
 from bq_common import (
-    # BQTableConfig, 
-    # BQRecord, 
-    # BQCDCRestrictionProvider, 
+    BQTableConfig, 
+    BQRecord, 
     BQCDCWatermarkEstimatorProvider, 
     BQCDCWatermarkEstimator,
+    WriteTableWindowToGCS
 )
 
 from restriction import (
     BQCDCRestrictionProvider,
-    BQRecord,
-    BQTableConfig,
-    # BQCDCRestrictionTracker
+    BQCDCRestrictionTracker
 )
+
+from dedup import DeduplicateDoFn
 from utils import (
     convert_macros_to_seconds, 
     convert_macros_to_ts,
@@ -49,7 +49,10 @@ class JsonSink(fileio.FileSink):
 # File naming function for directory-per-table structure
 def table_naming(window, pane, shard_index, total_shards, compression, destination):
     # Destination is the table_name
-    return f"{destination}/output-{window}-{shard_index:05d}-of-{total_shards:05d}{compression}.json"
+    # Format window time as readable datetime
+    window_start = window.start.to_utc_datetime().strftime('%Y%m%d-%H%M%S')
+    window_end = window.end.to_utc_datetime().strftime('%Y%m%d-%H%M%S')
+    return f"{destination}/output-{window_start}-to-{window_end}-{shard_index:05d}-of-{total_shards:05d}{compression}.json"
 
 # Configuration
 PROJECT_ID = "akesh-test-483106"
@@ -100,7 +103,7 @@ class BQCDCDoFn(DoFn):
     def process(
         self,
         element: BQTableConfig,
-        tracker: OffsetRestrictionTracker = beam.DoFn.RestrictionParam(BQCDCRestrictionProvider()),
+        tracker: BQCDCRestrictionTracker = beam.DoFn.RestrictionParam(BQCDCRestrictionProvider()),
         watermark_estimator: BQCDCWatermarkEstimator = DoFn.WatermarkEstimatorParam(BQCDCWatermarkEstimatorProvider())
     ) -> typing.Iterable[beam.window.TimestampedValue]:
         
@@ -116,6 +119,7 @@ class BQCDCDoFn(DoFn):
        
         try:
             previous_succesfull_claim = tracker.current_restriction().prev_succefull_claim
+            logger.info(f"[{element.table_name}] Current Pos: {current_pos}, Target Pos: {target_pos}, Previous Successful Claim: {previous_succesfull_claim}")
             query_start_pos = (current_pos + previous_succesfull_claim) // 2 
             query = self._build_query(element.table_name, query_start_pos, target_pos)
             
@@ -134,7 +138,7 @@ class BQCDCDoFn(DoFn):
             
             # Track the max timestamp across all processed records
             max_claimed_pos = current_pos # Initialize to current position
-            
+            logger.info(f"Processing {len(rows)} records at for table {element.table_name} from {convert_macros_to_ts(query_start_pos)} to {convert_macros_to_ts(target_pos)}")
             for row in rows:
                 payload = dict(row)
                 
@@ -151,10 +155,12 @@ class BQCDCDoFn(DoFn):
                     event_id = payload.get('event_id', "NULL"),
                     change_type=payload.get('change_type', 'UNKNOWN'),
                     payload=payload.get('payload', {}),
-                    change_timestamp=ts_dt.isoformat() if ts_dt else now.isoformat()
+                    change_timestamp=ts_dt.isoformat() if ts_dt else now.isoformat(),
+                    is_late = record_pos < current_pos
+                    
                 )
                 
-                watermark_estimator.observe_timestamp(Timestamp.of(ts_seconds))
+                watermark_estimator.observe_timestamp(Timestamp.of(ts_seconds-30))  # small lag to avoid watermark going beyond data
                 yield beam.window.TimestampedValue(record, ts_seconds)
 
             # Claim ONCE at the end using the max timestamp seen
@@ -162,7 +168,7 @@ class BQCDCDoFn(DoFn):
                 logger.warning(f"[{element.table_name}] Final claim failed at {max_claimed_pos} with current position {convert_macros_to_ts(current_pos)}.")
                 tracker.defer_remainder(Duration.of(seconds=element.poll_interval))
                 return
-                
+            logger.info(f"[{element.table_name}] Successfully claimed up to {convert_macros_to_ts(max_claimed_pos)}   :  {max_claimed_pos}.")   
         except Exception as e:
             logger.error(f"Error querying BQ: {e}")
             raise e
@@ -201,13 +207,18 @@ def run(args, beam_args) -> None:
             pipeline
             | "CreateConfigs" >> beam.Create(table_configs)
             | "CDC Source" >> beam.ParDo(BQCDCDoFn(PROJECT_ID, DATASET))
+            # | "Key by EventID" >> beam.Map(lambda r: (f"{r.table_name}:{r.event_id}", r))
+            # | "Deduplicate" >> beam.ParDo(DeduplicateDoFn())
             | "Window" >> beam.WindowInto(beam.window.FixedWindows(60))
+            # | "KeyByTable" >> beam.Map(lambda r: (r.table_name, r))
+            # | "WriteSingleFilePerTable" >> beam.ParDo(WriteTableWindowToGCS(BUCKET, DATASET))
             | "Write" >> fileio.WriteToFiles(
                 path=f"gs://{BUCKET}/{DATASET}/",
                 destination=lambda record: record.table_name,
                 sink=JsonSink(),
-                file_naming=table_naming
-            )
+                file_naming=table_naming,
+                # shards=1, # 1 => 1 file per table per window. Not scalable for high throughput tables. Need to merge files downstream
+                )
         )
 
     logger.info("Pipeline submitted to Dataflow!")

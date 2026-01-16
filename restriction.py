@@ -8,28 +8,9 @@ from config import PRECISION
 
 from apache_beam.io.iobase import RestrictionProgress
 from apache_beam.io.iobase import RestrictionTracker
+from bq_common import BQTableConfig, BQRecord
 
 logger = logging.getLogger(__name__)
-
-class BQTableConfig(typing.NamedTuple):
-    table_name: str
-    poll_interval: int = 30
-
-class BQRecord(typing.NamedTuple):
-    event_id: str
-    change_type: str
-    change_timestamp: str
-    table_name: str
-    payload: typing.Dict[str, typing.Any]
-
-# class BQCDCRestriction(typing.NamedTuple):
-#     """Custom restriction that tracks query start position"""
-#     start: int
-#     stop: int
-#     prev_succefull_claim: int  # Stores the previous successful claim
-
-#     def size(self):
-#         return self.stop - self.start
     
 class BQCDCRestrictionRange(object):
   def __init__(self, start, stop, prev_succefull_claim=None):
@@ -37,11 +18,11 @@ class BQCDCRestrictionRange(object):
       raise ValueError(
           'Start offset must be not be larger than the stop offset. '
           'Received %d and %d respectively.' % (start, stop))
-    self.start = start
-    self.stop = stop
-    self.prev_succefull_claim = prev_succefull_claim if prev_succefull_claim is not None else start
+    self.start: int = start
+    self.stop: int = stop
+    self.prev_succefull_claim: int = prev_succefull_claim if prev_succefull_claim is not None else start
 
-  def __eq__(self, other):
+  def __eq__(self, other)-> bool:
     if not isinstance(other, BQCDCRestrictionRange):
       return False
 
@@ -91,10 +72,10 @@ class BQCDCRestrictionTracker(RestrictionTracker):
   """
   def __init__(self, offset_range: BQCDCRestrictionRange) -> None:
     assert isinstance(offset_range, BQCDCRestrictionRange), offset_range
-    self._range = offset_range
+    self._range: BQCDCRestrictionRange = offset_range
     self._current_position = None
     self._last_claim_attempt = None
-    self._checkpointed = False
+    self._checkpointed: bool = False
 
   def check_done(self):
     if (self._range.start != self._range.stop and
@@ -104,10 +85,9 @@ class BQCDCRestrictionTracker(RestrictionTracker):
           'BQCDCRestrictionTracker is not done since work in range [%s, %s) '
           'has not been claimed.' % (
               self._last_claim_attempt
-              if self._last_claim_attempt is not None else self._range.start,
-              self._range.stop))
+              if self._last_claim_attempt is not None else self._range.start, self._range.stop))
 
-  def current_restriction(self):
+  def current_restriction(self)-> BQCDCRestrictionRange:
     return self._range
 
   def current_progress(self) -> RestrictionProgress:
@@ -127,6 +107,9 @@ class BQCDCRestrictionTracker(RestrictionTracker):
 
   def stop_position(self):
     return self._range.stop
+  
+  def last_succ_claim_position(self):
+    return self._range.prev_succefull_claim
 
   def try_claim(self, position):
     if (self._last_claim_attempt is not None and position <= self._last_claim_attempt):
@@ -143,10 +126,9 @@ class BQCDCRestrictionTracker(RestrictionTracker):
           (position, self._range.start, self._range.stop))
 
     if self._range.start <= position < self._range.stop:
-        # update prev_succefull_claim to current position or start if current is None
-        self._range.prev_succefull_claim = self._current_position if self._current_position is not None else self._range.start
+        # update prev_succefull_claim to start of the current restriction range
+        self._range.prev_succefull_claim = self._range.start
         self._current_position = position
-      
         return True
 
     return False
@@ -162,10 +144,10 @@ class BQCDCRestrictionTracker(RestrictionTracker):
       if split_point < self._range.stop:
         if fraction_of_remainder == 0:
           self._checkpointed = True
-        self._range, residual_range = self._range.split_at(split_point, self._current_position)
+        self._range, residual_range = self._range.split_at(split_point, self.last_succ_claim_position())
         return self._range, residual_range
 
-  def is_bounded(self):
+  def is_bounded(self)-> bool:
     return False
 
 class BQCDCRestrictionProvider(RestrictionProvider):    
